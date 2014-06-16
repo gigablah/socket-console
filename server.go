@@ -4,18 +4,16 @@ import (
 	"github.com/codegangsta/negroni"
 	"github.com/gorilla/websocket"
 	"github.com/gorilla/mux"
-	"github.com/kr/pty"
+	"github.com/nu7hatch/gouuid"
 
+	"io"
+	"fmt"
 	"log"
 	"net/http"
-	"encoding/base64"
-	"flag"
-	"os"
-	"os/exec"
 )
 
 var (
-	cmdFlag string
+	b *Broker
 	addr = ":9000"
 	upgrader = websocket.Upgrader{
 		ReadBufferSize: 1024,
@@ -24,72 +22,71 @@ var (
 			return true
 		},
 	}
+	proc = make(map[string]*Process)
 )
 
-type wsPty struct {
-	Cmd *exec.Cmd
-	Pty *os.File
-}
-
-func (wp *wsPty) Start() {
-	var err error
-	args := flag.Args()
-	wp.Cmd = exec.Command(cmdFlag, args...)
-	wp.Pty, err = pty.Start(wp.Cmd)
+func jobHandler(w http.ResponseWriter, r *http.Request) {
+	u4, err := uuid.NewV4()
 	if err != nil {
-		log.Fatalf("Failed to start command: %s\n", err)
+		http.Error(w, fmt.Sprintf("Failed to generate UUID: %s\n", err), http.StatusInternalServerError)
+		return
 	}
-}
 
-func (wp *wsPty) Stop() {
-	wp.Pty.Close()
-	err := wp.Cmd.Wait()
-	if err != nil {
-		log.Printf("Failed to complete command: %s\n", err)
-	}
+	pid := u4.String()
+	proc[pid] = NewProcess(pid, b.messages)
+
+	go func() {
+		//defer delete(proc, pid)
+		proc[pid].Start()
+	}()
+
+	io.WriteString(w, fmt.Sprintf("Process %s created!\n", pid))
 }
 
 func consoleHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	pid := vars["pid"]
+
+	_, ok := proc[pid]
+	if !ok {
+		http.Error(w, "Process not found!\n", http.StatusInternalServerError)
+		return
+	}
+
 	c, ok := w.(http.CloseNotifier)
 	if !ok {
 		http.Error(w, "Close notification unsupported!\n", http.StatusInternalServerError)
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		if _, ok := err.(websocket.HandshakeError); ok {
+			return
+		}
 		log.Printf("Websocket upgrade failed: %s\n", err)
 	}
-	defer conn.Close()
+	defer ws.Close()
 
-	wp := wsPty{}
-	wp.Start()
-	defer wp.Stop()
-
-	go func() {
-		buf := make([]byte, 128)
-		for {
-			n, err := wp.Pty.Read(buf)
-			if err != nil {
-				log.Printf("Failed to read from pty master: %s\n", err)
-				return
-			}
-
-			out := make([]byte, base64.StdEncoding.EncodedLen(n))
-			base64.StdEncoding.Encode(out, buf[0:n])
-
-			err = conn.WriteMessage(websocket.TextMessage, out)
-			if err != nil {
-				log.Printf("Failed to send %d bytes on websocket: %s\n", n, err)
-				return
-			}
-		}
+	// Create new channel for this client
+	in := make(chan *Message)
+	b.joining <- in
+	defer func() {
+		b.leaving <- in
 	}()
 
 	closer := c.CloseNotify()
 
 	for {
 		select {
+		case m := <-in:
+			if m.ID == pid {
+				err := ws.WriteMessage(websocket.TextMessage, m.Body)
+				if err != nil {
+					log.Printf("Failed to write to websocket: %s\n", err)
+					return
+				}
+			}
 		case <-closer:
 			log.Println("Closing connection\n")
 			return
@@ -97,13 +94,14 @@ func consoleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func init() {
-	flag.StringVar(&cmdFlag, "cmd", "/usr/bin/top", "Command to execute")
-}
-
 func main() {
+	// Start the event broker
+	b = NewBroker()
+	b.Start()
+
 	r := mux.NewRouter()
-	r.HandleFunc("/console", consoleHandler)
+	r.HandleFunc("/console", jobHandler).Methods("POST")
+	r.HandleFunc("/console/{pid}", consoleHandler)
 
 	n := negroni.Classic()
 	n.UseHandler(r)
